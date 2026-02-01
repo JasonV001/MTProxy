@@ -105,163 +105,142 @@ select_ip_mode() {
     esac
 }
 
-# --- Python 版安装逻辑 ---
-install_mtp_python() {
-    prefetch_ips
-    echo -e "${BLUE}正在准备安装 Python 版...${PLAIN}"
-    
-    ARCH=$(uname -m)
-    case $ARCH in
-        x86_64) P_ARCH="amd64" ;;
-        aarch64) P_ARCH="arm64" ;;
-        armv7l) P_ARCH="armv6l" ;;
-        *) P_ARCH="$ARCH" ;;
-    esac
-    
-    TARGET_OS="debian"
-    [[ "$OS" == "alpine" ]] && TARGET_OS="alpine"
-    
-    TARGET_BIN="mtp-python-${TARGET_OS}-${P_ARCH}"
-    mkdir -p "$BIN_DIR"
-    
-    FOUND_PATH=""
-    if [ -f "./${TARGET_BIN}" ]; then
-        FOUND_PATH="./${TARGET_BIN}"
-    elif [ -f "${SCRIPT_DIR}/${TARGET_BIN}" ]; then
-        FOUND_PATH="${SCRIPT_DIR}/${TARGET_BIN}"
-    fi
-
-    if [ -n "$FOUND_PATH" ]; then
-        echo -e "${GREEN}检测到本地二进制文件: ${FOUND_PATH}${PLAIN}"
-        cp "${FOUND_PATH}" "$BIN_DIR/mtp-python"
-    else
-        echo -e "${BLUE}未找到本地文件，尝试从 GitHub 下载 (${TARGET_BIN})...${PLAIN}"
-        DOWNLOAD_URL="https://github.com/0xdabiaoge/MTProxy/releases/download/mtg-go.mtp-python/${TARGET_BIN}"
-        wget -O "$BIN_DIR/mtp-python" "$DOWNLOAD_URL"
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}下载失败！${PLAIN}"
-            echo -e "${YELLOW}请确保 GitHub Release 中存在文件: ${TARGET_BIN}${PLAIN}"
-            exit 1
-        fi
-        echo -e "${GREEN}下载并安装成功。${PLAIN}"
-    fi
-    chmod +x "$BIN_DIR/mtp-python"
-
-    read -p "请输入伪装域名 (默认 www.apple.com): " DOMAIN
-    [ -z "$DOMAIN" ] && DOMAIN="www.apple.com"
-    
-    read -p "请输入推广 TAG (留空则不设置): " ADTAG
-    
-    IP_MODE=$(select_ip_mode)
-
-    # 根据 IP 模式输入端口
-    if [[ "$IP_MODE" == "dual" ]]; then
-        read -p "请输入 IPv4 端口 (默认 443): " PORT
-        [ -z "$PORT" ] && PORT=443
-        read -p "请输入 IPv6 端口 (默认 $PORT): " PORT_V6
-        [ -z "$PORT_V6" ] && PORT_V6="$PORT"
-    else
-        read -p "请输入端口 (默认 443): " PORT
-        [ -z "$PORT" ] && PORT=443
-        PORT_V6=""
-    fi
-    
-    SECRET=$(generate_secret)
-    echo -e "${GREEN}生成的密钥: $SECRET${PLAIN}"
-    
-    mkdir -p "$CONFIG_DIR"
-    IPV4_CFG="\"0.0.0.0\""
-    IPV6_CFG="None"
-    if [[ "$IP_MODE" == "v6" ]]; then
-        IPV4_CFG="None"
-        IPV6_CFG="\"::\""
-    elif [[ "$IP_MODE" == "dual" ]]; then
-        IPV4_CFG="\"0.0.0.0\""
-        IPV6_CFG="\"::\""
-    fi
-
-    cat > "$CONFIG_DIR/config.py" <<EOF
-PORT = $PORT
-USERS = {
-    "tg": "$SECRET"
-}
-MODES = {
-    "classic": False,
-    "secure": False,
-    "tls": True
-}
-TLS_DOMAIN = "$DOMAIN"
-LISTEN_ADDR_IPV4 = $IPV4_CFG
-LISTEN_ADDR_IPV4 = $IPV4_CFG
-LISTEN_ADDR_IPV6 = $IPV6_CFG
-EOF
-
-    if [ -n "$PORT_V6" ]; then
-        echo "PORT_IPV6 = $PORT_V6" >> "$CONFIG_DIR/config.py"
-    fi
-
-    if [ -n "$ADTAG" ]; then
-        echo "AD_TAG = \"$ADTAG\"" >> "$CONFIG_DIR/config.py"
-    fi
-
-    create_service_python 1
-    check_service_status mtp-python
-    show_info_python "$PORT" "$SECRET" "$DOMAIN" "$IP_MODE" "$PORT_V6"
-}
-
-create_service_python() {
-    USE_BINARY=$1
-    echo -e "${BLUE}正在创建服务 (Python)...${PLAIN}"
-    EXEC_CMD="$BIN_DIR/mtp-python $CONFIG_DIR/config.py"
-    SERVICE_WORKDIR="$WORKDIR"
+# --- 服务状态检测 ---
+get_service_status_str() {
+    local SERVICE=$1
+    local status=""
     
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        cat > /etc/systemd/system/mtp-python.service <<EOF
-[Unit]
-Description=MTProto Proxy (Python)
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=$SERVICE_WORKDIR
-ExecStart=$EXEC_CMD
-Restart=always
-RestartSec=3
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload
-        systemctl enable mtp-python
-        systemctl restart mtp-python
-        
-    elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
-        cat > /etc/init.d/mtp-python <<EOF
-#!/sbin/openrc-run
-name="mtp-python"
-description="MTProto Proxy (Python)"
-directory="$SERVICE_WORKDIR"
-command="${EXEC_CMD%% *}" 
-command_args="${EXEC_CMD#* }"
-supervisor="supervise-daemon"
-respawn_delay=5
-respawn_max=0
-rc_ulimit="-n 65535"
-pidfile="/run/mtp-python.pid"
-output_log="/var/log/mtp-python.log"
-error_log="/var/log/mtp-python.log"
-
-depend() {
-    need net
-    after firewall
-}
-EOF
-        chmod +x /etc/init.d/mtp-python
-        rc-update add mtp-python default
-        rc-service mtp-python restart
+        if [ -f "/etc/systemd/system/${SERVICE}.service" ]; then
+            if systemctl is-active --quiet $SERVICE 2>/dev/null; then
+                status="${GREEN}● 运行中${PLAIN}"
+            else
+                status="${RED}○ 已停止${PLAIN}"
+            fi
+        else
+            status="${YELLOW}○ 未安装${PLAIN}"
+        fi
+    else
+        if [ -f "/etc/init.d/${SERVICE}" ]; then
+            if rc-service $SERVICE status 2>/dev/null | grep -q "started"; then
+                status="${GREEN}● 运行中${PLAIN}"
+            else
+                status="${RED}○ 已停止${PLAIN}"
+            fi
+        else
+            status="${YELLOW}○ 未安装${PLAIN}"
+        fi
     fi
+    
+    echo -e "$status"
 }
+
+# --- 查看所有服务状态 ---
+check_all_status() {
+    echo ""
+    echo -e "${BLUE}╔══════════════════════════════════════════╗${PLAIN}"
+    echo -e "${BLUE}║        MTProxy 服务状态详情              ║${PLAIN}"
+    echo -e "${BLUE}╠══════════════════════════════════════════╣${PLAIN}"
+    
+    for SERVICE in mtg mtp-rust; do
+        local NAME=""
+        case $SERVICE in
+            mtg) NAME="Go     版 (mtg)" ;;
+            mtp-rust) NAME="Rust   版" ;;
+        esac
+        
+        local STATUS=""
+        local PID=""
+        local MEMORY=""
+        local UPTIME=""
+        
+        if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+            if [ -f "/etc/systemd/system/${SERVICE}.service" ]; then
+                if systemctl is-active --quiet $SERVICE 2>/dev/null; then
+                    STATUS="${GREEN}运行中${PLAIN}"
+                    PID=$(systemctl show -p MainPID --value $SERVICE 2>/dev/null)
+                    if [ -n "$PID" ] && [ "$PID" != "0" ]; then
+                        MEMORY=$(ps -o rss= -p $PID 2>/dev/null | awk '{printf "%.1f MB", $1/1024}')
+                        UPTIME=$(ps -o etime= -p $PID 2>/dev/null | xargs)
+                    fi
+                else
+                    STATUS="${RED}已停止${PLAIN}"
+                fi
+            else
+                STATUS="${YELLOW}未安装${PLAIN}"
+            fi
+        else
+            if [ -f "/etc/init.d/${SERVICE}" ]; then
+                if rc-service $SERVICE status 2>/dev/null | grep -q "started"; then
+                    STATUS="${GREEN}运行中${PLAIN}"
+                    PID=$(cat /run/${SERVICE}.pid 2>/dev/null)
+                    if [ -n "$PID" ]; then
+                        MEMORY=$(ps -o rss= -p $PID 2>/dev/null | awk '{printf "%.1f MB", $1/1024}')
+                    fi
+                else
+                    STATUS="${RED}已停止${PLAIN}"
+                fi
+            else
+                STATUS="${YELLOW}未安装${PLAIN}"
+            fi
+        fi
+        
+        printf "${BLUE}║${PLAIN} %-12s 状态: %-20s ${BLUE}║${PLAIN}\n" "$NAME" "$(echo -e $STATUS)"
+        if [ -n "$PID" ] && [ "$PID" != "0" ]; then
+            printf "${BLUE}║${PLAIN}   PID: %-6s 内存: %-8s 运行: %-6s ${BLUE}║${PLAIN}\n" "$PID" "$MEMORY" "$UPTIME"
+        fi
+    done
+    
+    echo -e "${BLUE}╚══════════════════════════════════════════╝${PLAIN}"
+    echo ""
+}
+
+# --- 查看服务日志 ---
+view_logs() {
+    echo ""
+    echo -e "${BLUE}请选择要查看的日志:${PLAIN}"
+    echo -e "${GREEN}1.${PLAIN} Go 版日志 (mtg)"
+    echo -e "${GREEN}2.${PLAIN} Rust 版日志 (mtp-rust)"
+    echo -e "${GREEN}3.${PLAIN} 实时跟踪所有日志"
+    echo -e "${GREEN}0.${PLAIN} 返回主菜单"
+    read -p "请选择: " log_choice
+    
+    case $log_choice in
+        1)
+            echo -e "${BLUE}=== Go 版日志 (最近 50 行) ===${PLAIN}"
+            if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+                journalctl -u mtg -n 50 --no-pager
+            else
+                tail -n 50 /var/log/mtg.log 2>/dev/null || echo "日志文件不存在"
+            fi
+            ;;
+        2)
+            echo -e "${BLUE}=== Rust 版日志 (最近 50 行) ===${PLAIN}"
+            if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+                journalctl -u mtp-rust -n 50 --no-pager
+            else
+                tail -n 50 /var/log/mtp-rust.log 2>/dev/null || echo "日志文件不存在"
+            fi
+            ;;
+        3)
+            echo -e "${YELLOW}正在实时跟踪日志 (按 Ctrl+C 退出)...${PLAIN}"
+            if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+                journalctl -u mtg -u mtp-rust -f
+            else
+                tail -f /var/log/mtg.log /var/log/mtp-rust.log 2>/dev/null
+            fi
+            ;;
+        0)
+            return
+            ;;
+        *)
+            echo -e "${RED}无效选项${PLAIN}"
+            ;;
+    esac
+}
+
+# --- Python 版安装逻辑 ---
+
 
 # --- Go 版安装逻辑 ---
 install_mtg() {
@@ -288,7 +267,7 @@ install_mtg() {
         cp "${FOUND_PATH}" "$BIN_DIR/mtg-go"
     else
         echo -e "${BLUE}未找到本地文件，尝试从 GitHub 下载 (${TARGET_NAME})...${PLAIN}"
-        DOWNLOAD_URL="https://github.com/0xdabiaoge/MTProxy/releases/download/mtg-go.mtp-python/${TARGET_NAME}"
+        DOWNLOAD_URL="https://github.com/0xdabiaoge/MTProxy/releases/download/Go-Rust/${TARGET_NAME}"
         wget -O "$BIN_DIR/mtg-go" "$DOWNLOAD_URL"
         if [ $? -ne 0 ]; then
             echo -e "${RED}下载失败！${PLAIN}"
@@ -389,6 +368,169 @@ EOF
     fi
 }
 
+# === Rust 版安装逻辑 ===
+install_mtp_rust() {
+    prefetch_ips
+    echo -e "${BLUE}正在准备安装 Rust 版...${PLAIN}"
+    
+    ARCH=$(uname -m)
+    case $ARCH in
+        x86_64) R_ARCH="amd64" ;;
+        aarch64) R_ARCH="arm64" ;;
+        *) R_ARCH="$ARCH" ;;
+    esac
+    
+    # Rust 版使用通用的 linux 命名（musl 静态链接）
+    TARGET_BIN="mtp-rust-linux-${R_ARCH}"
+    mkdir -p "$BIN_DIR"
+    
+    FOUND_PATH=""
+    if [ -f "./${TARGET_BIN}" ]; then
+        FOUND_PATH="./${TARGET_BIN}"
+    elif [ -f "${SCRIPT_DIR}/${TARGET_BIN}" ]; then
+        FOUND_PATH="${SCRIPT_DIR}/${TARGET_BIN}"
+    fi
+
+    if [ -n "$FOUND_PATH" ]; then
+        echo -e "${GREEN}检测到本地二进制文件: ${FOUND_PATH}${PLAIN}"
+        cp "${FOUND_PATH}" "$BIN_DIR/mtp-rust"
+    else
+        echo -e "${BLUE}未找到本地文件，尝试从 GitHub 下载 (${TARGET_BIN})...${PLAIN}"
+        DOWNLOAD_URL="https://github.com/0xdabiaoge/MTProxy/releases/download/Go-Rust/${TARGET_BIN}"
+        wget -O "$BIN_DIR/mtp-rust" "$DOWNLOAD_URL"
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}下载失败！${PLAIN}"
+            echo -e "${YELLOW}请将以下文件放在脚本同目录:${PLAIN}"
+            echo -e "  - mtp-rust-linux-amd64"
+            echo -e "  - mtp-rust-linux-arm64"
+            return 1
+        fi
+    fi
+    chmod +x "$BIN_DIR/mtp-rust"
+
+    read -p "请输入伪装域名 (默认 www.apple.com): " DOMAIN
+    [ -z "$DOMAIN" ] && DOMAIN="www.apple.com"
+    
+    IP_MODE=$(select_ip_mode)
+
+    read -p "请输入端口 (默认 443): " PORT
+    [ -z "$PORT" ] && PORT=443
+    
+    SECRET=$(generate_secret)
+    echo -e "${GREEN}生成的密钥: $SECRET${PLAIN}"
+    
+    # 构建完整的 ee 密钥
+    HEX_DOMAIN=$(echo -n "$DOMAIN" | od -A n -t x1 | tr -d ' \n')
+    FULL_SECRET="ee${SECRET}${HEX_DOMAIN}"
+    
+    # 保存配置到文件
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_DIR/rust.conf" <<EOF
+PORT=$PORT
+SECRET=$FULL_SECRET
+DOMAIN=$DOMAIN
+IP_MODE=$IP_MODE
+EOF
+
+    create_service_rust "$PORT" "$FULL_SECRET" "$IP_MODE"
+    check_service_status mtp-rust
+    show_info_rust "$PORT" "$SECRET" "$DOMAIN" "$IP_MODE"
+}
+
+create_service_rust() {
+    PORT=$1
+    FULL_SECRET=$2
+    IP_MODE=$3
+    
+    EXEC_CMD="$BIN_DIR/mtp-rust -p $PORT -s $FULL_SECRET"
+    
+    if [[ "$IP_MODE" == "v6" ]]; then
+        EXEC_CMD="$EXEC_CMD --prefer-ipv6"
+    fi
+    
+    echo -e "${BLUE}正在创建服务 (Rust)...${PLAIN}"
+    
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        cat > /etc/systemd/system/mtp-rust.service <<EOF
+[Unit]
+Description=MTProto Proxy (Rust)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$EXEC_CMD
+Restart=always
+RestartSec=3
+LimitNOFILE=65535
+Environment="RUST_LOG=info"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable mtp-rust
+        systemctl restart mtp-rust
+        
+    elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        cat > /etc/init.d/mtp-rust <<EOF
+#!/sbin/openrc-run
+name="mtp-rust"
+description="MTProto Proxy (Rust)"
+command="$BIN_DIR/mtp-rust"
+command_args="-p $PORT -s $FULL_SECRET"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+rc_ulimit="-n 65535"
+pidfile="/run/mtp-rust.pid"
+output_log="/var/log/mtp-rust.log"
+error_log="/var/log/mtp-rust.log"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+        chmod +x /etc/init.d/mtp-rust
+        rc-update add mtp-rust default
+        rc-service mtp-rust restart
+    fi
+}
+
+show_info_rust() {
+    IPV4=$PUBLIC_IPV4
+    IPV6=$PUBLIC_IPV6
+    [ -z "$IPV4" ] && IPV4=$(get_public_ip)
+    [ -z "$IPV6" ] && IPV6=$(get_public_ipv6)
+    
+    IP_MODE=$4
+    
+    HEX_DOMAIN=$(echo -n "$3" | od -A n -t x1 | tr -d ' \n')
+    FULL_SECRET="ee$2$HEX_DOMAIN"
+    
+    echo -e "=============================="
+    echo -e "${GREEN}Rust 版连接信息${PLAIN}"
+    echo -e "端口: $1"
+    echo -e "Secret: $FULL_SECRET"
+    echo -e "Domain: $3"
+    echo -e "------------------------------"
+    
+    if [[ "$IP_MODE" == "v4" || "$IP_MODE" == "dual" ]]; then
+        if [ -n "$IPV4" ]; then
+            echo -e "${GREEN}IPv4 链接:${PLAIN}"
+            echo -e "tg://proxy?server=$IPV4&port=$1&secret=$FULL_SECRET"
+        fi
+    fi
+    
+    if [[ "$IP_MODE" == "v6" || "$IP_MODE" == "dual" ]]; then
+        if [ -n "$IPV6" ]; then
+            echo -e "${GREEN}IPv6 链接:${PLAIN}"
+            echo -e "tg://proxy?server=$IPV6&port=$1&secret=$FULL_SECRET"
+        fi
+    fi
+    echo -e "=============================="
+}
+
 check_service_status() {
     local service=$1
     sleep 2
@@ -469,16 +611,20 @@ modify_mtg() {
     show_info_mtg "$NEW_PORT" "$NEW_SECRET" "$NEW_DOMAIN" "$CUR_IP_MODE"
 }
 
-modify_python() {
-    if [ ! -f "$CONFIG_DIR/config.py" ]; then
-         echo -e "${YELLOW}未检测到 Python 版配置文件。${PLAIN}"
+
+
+modify_rust() {
+    if [ ! -f "$CONFIG_DIR/rust.conf" ]; then
+         echo -e "${YELLOW}未检测到 Rust 版配置文件。${PLAIN}"
          return
     fi
     
-    CUR_PORT=$(grep "PORT =" "$CONFIG_DIR/config.py" | awk '{print $3}' | tr -d ' ')
-    CUR_DOMAIN=$(grep "TLS_DOMAIN =" "$CONFIG_DIR/config.py" | awk -F= '{print $2}' | tr -d ' "')
+    source "$CONFIG_DIR/rust.conf"
+    CUR_PORT=$PORT
+    CUR_DOMAIN=$DOMAIN
+    CUR_IP_MODE=$IP_MODE
     
-    echo -e "当前配置 (Python): 端口=[${GREEN}$CUR_PORT${PLAIN}] 域名=[${GREEN}$CUR_DOMAIN${PLAIN}]"
+    echo -e "当前配置 (Rust): 端口=[${GREEN}$CUR_PORT${PLAIN}] 域名=[${GREEN}$CUR_DOMAIN${PLAIN}]"
     
     read -p "请输入新端口 (留空保持不变): " NEW_PORT
     [ -z "$NEW_PORT" ] && NEW_PORT="$CUR_PORT"
@@ -491,41 +637,33 @@ modify_python() {
         return
     fi
     
-    echo -e "${BLUE}正在更新配置文件...${PLAIN}"
-    sed -i "s/PORT = .*/PORT = $NEW_PORT/" "$CONFIG_DIR/config.py"
-    sed -i "s/TLS_DOMAIN = .*/TLS_DOMAIN = \"$NEW_DOMAIN\"/" "$CONFIG_DIR/config.py"
+    NEW_SECRET=$(generate_secret)
+    echo -e "${GREEN}新密钥: $NEW_SECRET${PLAIN}"
     
-    control_service restart mtp-python
+    HEX_DOMAIN=$(echo -n "$NEW_DOMAIN" | od -A n -t x1 | tr -d ' \n')
+    NEW_FULL_SECRET="ee${NEW_SECRET}${HEX_DOMAIN}"
     
-    # 重新提取 Secret
-    CUR_SECRET=$(grep "\"tg\":" "$CONFIG_DIR/config.py" | head -n 1 | awk -F: '{print $2}' | tr -d ' "')
+    cat > "$CONFIG_DIR/rust.conf" <<EOF
+PORT=$NEW_PORT
+SECRET=$NEW_FULL_SECRET
+DOMAIN=$NEW_DOMAIN
+IP_MODE=$CUR_IP_MODE
+EOF
     
-    # 获取当前 Python 模式
-    CUR_IP_MODE="v4"
-    if grep -q "LISTEN_ADDR_IPV6 = \"::\"" "$CONFIG_DIR/config.py"; then
-            if grep -q "LISTEN_ADDR_IPV4 = \"0.0.0.0\"" "$CONFIG_DIR/config.py"; then
-                CUR_IP_MODE="dual"
-            else
-                CUR_IP_MODE="v6"
-            fi
-    fi
-    
-    # 获取 V6 端口 (如果是双栈且被单独定义)
-    CUR_PORT_V6=$(grep "PORT_IPV6 =" "$CONFIG_DIR/config.py" | awk '{print $3}' | tr -d ' ')
-    if [ -z "$CUR_PORT_V6" ]; then CUR_PORT_V6="$NEW_PORT"; fi
-    
-    show_info_python "$NEW_PORT" "$CUR_SECRET" "$NEW_DOMAIN" "$CUR_IP_MODE" "$CUR_PORT_V6"
+    create_service_rust "$NEW_PORT" "$NEW_FULL_SECRET" "$CUR_IP_MODE"
+    check_service_status mtp-rust
+    show_info_rust "$NEW_PORT" "$NEW_SECRET" "$NEW_DOMAIN" "$CUR_IP_MODE"
 }
 
 modify_config() {
     echo ""
     echo -e "请选择要修改的服务:"
     echo -e "1. MTProxy (Go 版)"
-    echo -e "2. MTProxy (Python 版)"
+    echo -e "2. MTProxy (Rust 版)"
     read -p "请选择 [1-2]: " m_choice
     case $m_choice in
         1) modify_mtg ;;
-        2) modify_python ;;
+        2) modify_rust ;;
         *) echo -e "${RED}无效选择${PLAIN}" ;;
     esac
     back_to_menu
@@ -548,32 +686,34 @@ delete_mtg() {
     echo -e "${GREEN}Go 版服务已删除。${PLAIN}"
 }
 
-delete_python() {
-    echo -e "${RED}正在删除 MTProxy (Python 版)...${PLAIN}"
+
+
+delete_rust() {
+    echo -e "${RED}正在删除 MTProxy (Rust 版)...${PLAIN}"
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        systemctl stop mtp-python 2>/dev/null
-        systemctl disable mtp-python 2>/dev/null
-        rm -f /etc/systemd/system/mtp-python.service
+        systemctl stop mtp-rust 2>/dev/null
+        systemctl disable mtp-rust 2>/dev/null
+        rm -f /etc/systemd/system/mtp-rust.service
         systemctl daemon-reload
     else
-        rc-service mtp-python stop 2>/dev/null
-        rc-update del mtp-python 2>/dev/null
-        rm -f /etc/init.d/mtp-python
+        rc-service mtp-rust stop 2>/dev/null
+        rc-update del mtp-rust 2>/dev/null
+        rm -f /etc/init.d/mtp-rust
     fi
-    rm -f "$BIN_DIR/mtp-python"
-    rm -f "$CONFIG_DIR/config.py"
-    echo -e "${GREEN}Python 版服务已删除。${PLAIN}"
+    rm -f "$BIN_DIR/mtp-rust"
+    rm -f "$CONFIG_DIR/rust.conf"
+    echo -e "${GREEN}Rust 版服务已删除。${PLAIN}"
 }
 
 delete_config() {
     echo ""
     echo -e "请选择要删除的服务 (仅删除配置和服务，不全盘卸载):"
     echo -e "1. MTProxy (Go 版)"
-    echo -e "2. MTProxy (Python 版)"
+    echo -e "2. MTProxy (Rust 版)"
     read -p "请选择 [1-2]: " d_choice
     case $d_choice in
         1) delete_mtg ;;
-        2) delete_python ;;
+        2) delete_rust ;;
         *) echo -e "${RED}无效选择${PLAIN}" ;;
     esac
     back_to_menu
@@ -619,28 +759,14 @@ show_detail_info() {
         echo -e "${YELLOW}未安装或未运行${PLAIN}"
     fi
     
+
+    
     echo -e ""
-    echo -e "${BLUE}=== Python 版信息 ===${PLAIN}"
-    if [ -f "$CONFIG_DIR/config.py" ]; then
-        PORT=$(grep "PORT =" "$CONFIG_DIR/config.py" | head -n 1 | awk '{print $3}' | tr -d ' ')
-        SECRET=$(grep "\"tg\":" "$CONFIG_DIR/config.py" | head -n 1 | awk -F: '{print $2}' | tr -d ' "')
-        DOMAIN=$(grep "TLS_DOMAIN =" "$CONFIG_DIR/config.py" | awk -F= '{print $2}' | tr -d ' "')
-        
-        # 获取 IP 模式
-        PY_IP_MODE="v4"
-        if grep -q "LISTEN_ADDR_IPV6 = \"::\"" "$CONFIG_DIR/config.py"; then
-            if grep -q "LISTEN_ADDR_IPV4 = \"0.0.0.0\"" "$CONFIG_DIR/config.py"; then
-                PY_IP_MODE="dual"
-            else
-                PY_IP_MODE="v6"
-            fi
-        fi
-        
-        # 获取 V6 端口
-        PORT_V6=$(grep "PORT_IPV6 =" "$CONFIG_DIR/config.py" | awk '{print $3}' | tr -d ' ')
-        [ -z "$PORT_V6" ] && PORT_V6="$PORT"
-        
-        show_info_python "$PORT" "$SECRET" "$DOMAIN" "$PY_IP_MODE" "$PORT_V6"
+    echo -e "${BLUE}=== Rust 版信息 ===${PLAIN}"
+    if [ -f "$CONFIG_DIR/rust.conf" ]; then
+        source "$CONFIG_DIR/rust.conf"
+        BASE_SECRET=${SECRET:2:32}
+        show_info_rust "$PORT" "$BASE_SECRET" "$DOMAIN" "$IP_MODE"
     else
         echo -e "${YELLOW}未安装配置文件${PLAIN}"
     fi
@@ -649,49 +775,7 @@ show_detail_info() {
 }
 
 # --- 信息显示 ---
-show_info_python() {
-    # 使用预获取的 IP
-    IPV4=$PUBLIC_IPV4
-    IPV6=$PUBLIC_IPV6
-    # 如果为空则尝试再次获取
-    [ -z "$IPV4" ] && IPV4=$(get_public_ip)
-    [ -z "$IPV6" ] && IPV6=$(get_public_ipv6)
-    
-    IP_MODE=$4
-    
-    HEX_DOMAIN=$(echo -n "$3" | od -A n -t x1 | tr -d ' \n')
-    FULL_SECRET="ee$2$HEX_DOMAIN"
-    
-    echo -e "=============================="
-    echo -e "${GREEN}Python 版连接信息${PLAIN}"
-    echo -e "端口: $1"
-    echo -e "Secret: $FULL_SECRET"
-    echo -e "Domain: $3"
-    echo -e "------------------------------"
-    
-    if [[ "$IP_MODE" == "v4" || "$IP_MODE" == "dual" ]]; then
-        if [ -n "$IPV4" ]; then
-            echo -e "${GREEN}IPv4 链接:${PLAIN}"
-            echo -e "tg://proxy?server=$IPV4&port=$1&secret=$FULL_SECRET"
-        else
-            echo -e "${RED}未检测到 IPv4 地址${PLAIN}"
-        fi
-    fi
-    
-    if [[ "$IP_MODE" == "v6" || "$IP_MODE" == "dual" ]]; then
-        # 如果定义了 PORT_V6 (第5个参数)，则使用它，否则默认用 端口1
-        PORT_V6=$5
-        [ -z "$PORT_V6" ] && PORT_V6="$1"
-        
-        if [ -n "$IPV6" ]; then
-            echo -e "${GREEN}IPv6 链接:${PLAIN}"
-            echo -e "tg://proxy?server=$IPV6&port=$PORT_V6&secret=$FULL_SECRET"
-        else
-            echo -e "${YELLOW}未检测到 IPv6 地址${PLAIN}"
-        fi
-    fi
-    echo -e "=============================="
-}
+
 
 show_info_mtg() {
     # 使用预获取的 IP
@@ -756,7 +840,7 @@ get_service_status_str() {
 control_service() {
     ACTION=$1
     shift
-    TARGETS="mtg mtp-python"
+    TARGETS="mtg mtp-rust"
     # 如果指定了具体服务名，就只操作那一个
     if [[ -n "$1" ]]; then TARGETS="$1"; fi
     
@@ -780,20 +864,20 @@ delete_all() {
     control_service stop
     
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-        systemctl disable mtg mtp-python 2>/dev/null
-        rm -f /etc/systemd/system/mtg.service /etc/systemd/system/mtp-python.service
+        systemctl disable mtg mtp-rust 2>/dev/null
+        rm -f /etc/systemd/system/mtg.service /etc/systemd/system/mtp-rust.service
         systemctl daemon-reload
     else
         rc-update del mtg default 2>/dev/null
-        rc-update del mtp-python default 2>/dev/null
-        rm -f /etc/init.d/mtg /etc/init.d/mtp-python
+        rc-update del mtp-rust default 2>/dev/null
+        rm -f /etc/init.d/mtg /etc/init.d/mtp-rust
     fi
     
     rm -rf "$WORKDIR"
     
     echo -e "${RED}清理本地安装包...${PLAIN}"
-    rm -f "${SCRIPT_DIR}/mtp-python"* 
     rm -f "${SCRIPT_DIR}/mtg-go"*
+    rm -f "${SCRIPT_DIR}/mtp-rust"*
 
     # 删除脚本自身
     rm -f "$0"
@@ -808,44 +892,63 @@ back_to_menu() {
 }
 
 # --- 菜单 ---
+# --- 菜单 ---
 menu() {
     check_sys
     clear
-    echo -e "=================================="
-    echo -e "     MTProxy 部署管理脚本"
-    echo -e "=================================="
-    echo -e "Go     版: $(get_service_status_str mtg)"
-    echo -e "Python 版: $(get_service_status_str mtp-python)"
-    echo -e "=================================="
-    echo -e "${GREEN}1.${PLAIN} 安装/重装 Go 版"
-    echo -e "${GREEN}2.${PLAIN} 安装/重装 Python 版"
-    echo -e "----------------------------------"
-    echo -e "${GREEN}3.${PLAIN} 查看详细连接信息"
-    echo -e "${GREEN}4.${PLAIN} 修改服务配置 (端口/域名)"
-    echo -e "${GREEN}5.${PLAIN} 删除服务配置 (选择删除)"
-    echo -e "----------------------------------"
-    echo -e "${GREEN}6.${PLAIN} 启动服务"
-    echo -e "${GREEN}7.${PLAIN} 停止服务"
-    echo -e "${GREEN}8.${PLAIN} 重启服务"
-    echo -e "----------------------------------"
-    echo -e "${GREEN}9.${PLAIN} 卸载全部并清理"
-    echo -e "${GREEN}0.${PLAIN} 退出"
-    echo -e "=================================="
-    read -p "请选择: " choice
+    echo -e ""
+    echo -e "${BLUE} __  __ _____ ____                      ${PLAIN}"
+    echo -e "${BLUE}|  \/  |_   _|  _ \ _ __ _____  ___   _ ${PLAIN}"
+    echo -e "${BLUE}| |\/| | | | | |_) | '__/ _ \ \/ / | | |${PLAIN}"
+    echo -e "${BLUE}| |  | | | | |  __/| | | (_) >  <| |_| |${PLAIN}"
+    echo -e "${BLUE}|_|  |_| |_| |_|   |_|  \___/_/\_\\\\__, |${PLAIN}"
+    echo -e "${BLUE}                                  |___/ ${PLAIN}${GREEN}Lite Manager${PLAIN}"
+    echo -e ""
+    echo -e "  ${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${PLAIN}"
+    echo -e "          ${GREEN}MTProxy 管理脚本 v2.0${PLAIN}"
+    echo -e "  ${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${PLAIN}"
+    echo -e ""
+    echo -e "  系统: ${GREEN}${OS}${PLAIN}  |  模式: ${GREEN}${INIT_SYSTEM}${PLAIN}"
+    echo -e "  Go 版: $(get_service_status_str mtg)  Rust 版: $(get_service_status_str mtp-rust)"
+    echo -e ""
+    echo -e "  ${YELLOW}【安 装】${PLAIN}"
+    echo -e "    ${GREEN}[1]${PLAIN} 安装 Go 版          ${GREEN}[2]${PLAIN} 安装 Rust 版"
+    echo -e ""
+    echo -e "  ${YELLOW}【管 理】${PLAIN}"
+    echo -e "    ${GREEN}[3]${PLAIN} 查看连接信息        ${GREEN}[4]${PLAIN} 修改配置"
+    echo -e "    ${GREEN}[5]${PLAIN} 删除配置"
+    echo -e ""
+    echo -e "  ${YELLOW}【状态与日志】${PLAIN}"
+    echo -e "    ${GREEN}[6]${PLAIN} 查看运行状态        ${GREEN}[7]${PLAIN} 查看日志"
+    echo -e ""
+    echo -e "  ${YELLOW}【服务控制】${PLAIN}"
+    echo -e "    ${GREEN}[8]${PLAIN} 启动服务            ${GREEN}[9]${PLAIN} 停止服务"
+    echo -e "    ${GREEN}[10]${PLAIN} 重启服务"
+    echo -e ""
+    echo -e "  ${RED}【危险操作】${PLAIN}"
+    echo -e "    ${RED}[11]${PLAIN} 卸载全部并清理"
+    echo -e ""
+    echo -e "    ${GREEN}[0]${PLAIN} 退出脚本"
+    echo -e ""
+    read -p "  请输入选项 [0-11]: " choice
     
     case $choice in
         1) install_base_deps; install_mtg; back_to_menu ;;
-        2) install_base_deps; install_mtp_python; back_to_menu ;;
+        2) install_base_deps; install_mtp_rust; back_to_menu ;;
         3) show_detail_info ;;
         4) modify_config ;;
         5) delete_config ;;
-        6) control_service start; back_to_menu ;;
-        7) control_service stop; back_to_menu ;;
-        8) control_service restart; back_to_menu ;;
-        9) delete_all; exit 0 ;;
-        0) exit 0 ;;
-        *) echo -e "${RED}无效此选项${PLAIN}"; menu ;;
+        6) check_all_status; back_to_menu ;;
+        7) view_logs; back_to_menu ;;
+        8) control_service start; back_to_menu ;;
+        9) control_service stop; back_to_menu ;;
+        10) control_service restart; back_to_menu ;;
+        11) delete_all; exit 0 ;;
+        0) echo -e "${GREEN}再见!${PLAIN}"; exit 0 ;;
+        *) echo -e "${RED}无效选项${PLAIN}"; sleep 1; menu ;;
     esac
 }
 
 menu
+
+
